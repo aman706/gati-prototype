@@ -1,7 +1,12 @@
 """
-app_survival.py
+app_survival.py (updated)
 
-Streamlit app to inspect per-stage survival functions and run simple counterfactuals.
+Adds:
+- Expected time (restricted mean up to horizon) + delay probability display
+- SHAP explainability using surrogate regressor per stage
+- Case timeline visualization from data/legal_events.csv
+- What-if simulator: feature adjustments + "expedite stage by X days" (shifts survival curve)
+- RFCTLARR stage mapping labels
 """
 import streamlit as st
 import pandas as pd
@@ -10,163 +15,273 @@ import numpy as np
 import matplotlib.pyplot as plt
 import json
 import os
+import shap
 
-st.set_page_config(layout="wide", page_title="GATI - Survival Prototype")
+st.set_page_config(layout="wide", page_title="GATI - Survival Prototype (enhanced)")
 
 @st.cache_data
 def load_data():
     df = pd.read_csv("data/projects.csv")
-    return df
+    legal = pd.read_csv("data/legal_events.csv")
+    return df, legal
 
 @st.cache_resource
-def load_models():
+def load_models_and_surrogates():
     stages = ["notification","award","compensation","rnr","possession"]
-    models = {}
+    rsf_models = {}
+    surrogates = {}
+    metas = {}
     for s in stages:
-        path = f"models/{s}_rsf.joblib"
-        if os.path.exists(path):
-            models[s] = joblib.load(path)
-    return models
+        p_rsf = f"models/{s}_rsf.joblib"
+        p_sur = f"models/{s}_surrogate.joblib"
+        p_meta = f"models/{s}_meta.joblib"
+        if os.path.exists(p_rsf):
+            rsf_models[s] = joblib.load(p_rsf)
+        if os.path.exists(p_sur):
+            surrogates[s] = joblib.load(p_sur)
+        if os.path.exists(p_meta):
+            metas[s] = joblib.load(p_meta)
+    return rsf_models, surrogates, metas
 
-@st.cache_data
-def load_districts():
-    with open("data/districts.json","r") as f:
-        return json.load(f)
+STAGE_LABELS = {
+    "notification": "Notification (Section: Statutory notification)",
+    "award": "Award (Determination of acquisition)",
+    "compensation": "Compensation (Determination & disbursement)",
+    "rnr": "R&R (Rehabilitation & Resettlement)",
+    "possession": "Possession (Physical takeover)"
+}
 
-df = load_data()
-models = load_models()
-districts = load_districts()
+RISK_HORIZON = 180
 
-st.title("GATI — Survival-model prototype")
+(df, legal_df) = load_data()
+rsf_models, surrogates, metas = load_models_and_surrogates()
 
-# sidebar
+st.title("GATI — Survival-model prototype (enhanced)")
+
+# sidebar controls
 st.sidebar.header("Controls")
 selected_district = st.sidebar.selectbox("District", options=["All"] + sorted(df["district"].unique().tolist()))
-selected_stage = st.sidebar.selectbox("Stage to inspect", options=list(models.keys()))
-risk_horizon = st.sidebar.slider("Risk horizon (days)", 30, 730, 180)
+selected_stage = st.sidebar.selectbox("Stage to inspect", options=list(rsf_models.keys()))
+risk_horizon = st.sidebar.slider("Risk horizon (days)", 30, 730, RISK_HORIZON)
 
-# filter
+# filter dataset
 if selected_district != "All":
     df_view = df[df["district"] == selected_district].copy()
 else:
     df_view = df.copy()
 
-st.header("District-level summary")
-# compute mean risk-within-T for each district using model predictions
-agg_rows = []
+st.header("Dashboard: district risk overview")
+# compute mean risk-within-T for each district using surrogate if available, else RSF
+agg = []
 for d, group in df_view.groupby("district"):
     row = {"district": d, "n_projects": len(group)}
-    for s, m in models.items():
-        # build X for this model's features
-        X = group[["district","project_type","land_category","area_ha","affected_families","collector_capacity","verification_teams","pending_projects","legal_risk"]]
+    for s in rsf_models.keys():
         try:
-            surv_funcs = m.predict_survival_function(X)
-            # each surv_func is a (times, surv) step function represented as array of (time, prob)
-            # compute risk within horizon as mean(1 - S(h))
-            risks = []
-            for fn in surv_funcs:
-                # fn is an array-like of (time, prob) in older API; for pipeline we might get list of step arrays
-                times = np.array(fn.x) if hasattr(fn, 'x') else np.array([t for t,_ in fn])
-                probs = np.array(fn.y) if hasattr(fn, 'y') else np.array([p for _,p in fn])
-                # find S(h)
-                if risk_horizon <= times[0]:
-                    S_h = 1.0
-                else:
-                    idx = np.searchsorted(times, risk_horizon, side='right') - 1
-                    idx = max(0, min(idx, len(probs)-1))
-                    S_h = probs[idx]
-                risks.append(1.0 - S_h)
-            row[f"risk_{s}"] = float(np.mean(risks))
+            if s in surrogates:
+                X = group[["district","project_type","land_category","area_ha","affected_families","collector_capacity","verification_teams","pending_projects","legal_risk"]]
+                preds = surrogates[s].predict(X)
+                risk = float(np.nanmean(preds))
+            else:
+                # fallback: use RSF survival functions and compute mean risk
+                X = group[["district","project_type","land_category","area_ha","affected_families","collector_capacity","verification_teams","pending_projects","legal_risk"]]
+                survs = rsf_models[s].predict_survival_function(X)
+                risks = []
+                for fn in survs:
+                    times_arr = np.array(fn.x) if hasattr(fn, 'x') else np.array([t for t,_ in fn])
+                    probs = np.array(fn.y) if hasattr(fn, 'y') else np.array([p for _,p in fn])
+                    if risk_horizon <= times_arr[0]:
+                        S_h = 1.0
+                    else:
+                        idx = np.searchsorted(times_arr, risk_horizon, side='right') - 1
+                        idx = max(0, min(idx, len(probs)-1))
+                        S_h = probs[idx]
+                    risks.append(1.0 - S_h)
+                risk = float(np.mean(risks))
+            row[f"risk_{s}"] = risk
         except Exception:
             row[f"risk_{s}"] = None
-    agg_rows.append(row)
-agg = pd.DataFrame(agg_rows).sort_values(f"risk_{selected_stage}", ascending=False)
-st.dataframe(agg, use_container_width=True)
+    agg.append(row)
+agg_df = pd.DataFrame(agg).sort_values(f"risk_{selected_stage}", ascending=False)
+st.dataframe(agg_df, use_container_width=True)
 
-st.header("Project list and per-project view")
-st.dataframe(df_view[["project_id","district","project_type","land_category","area_ha","affected_families","collector_capacity","pending_projects"]].head(200))
+# show a simple national heat-like bar for selected stage
+st.subheader(f"Top districts by risk (stage: {STAGE_LABELS.get(selected_stage, selected_stage)})")
+fig, ax = plt.subplots(figsize=(10,4))
+top = agg_df.head(12)
+ax.bar(top['district'], top[f"risk_{selected_stage}"], color='C3')
+ax.set_xticklabels(top['district'], rotation=45, ha='right')
+ax.set_ylabel(f"Mean risk within {risk_horizon} days")
+st.pyplot(fig)
 
+# project list
+st.header("Project list (district drill-down)")
+st.dataframe(df_view[["project_id","district","project_type","land_category","area_ha","affected_families","collector_capacity","pending_projects"]].sort_values("pending_projects", ascending=False).head(300))
+
+# project-detail panel
+st.header("Project detail, timeline, explainability, and what-if simulator")
 proj = st.selectbox("Select project", options=sorted(df_view["project_id"].tolist()))
 row = df[df["project_id"] == proj].iloc[0]
 st.subheader("Project profile")
 st.write(row[["district","project_type","land_category","area_ha","affected_families","collector_capacity","pending_projects","legal_risk"]])
 
-st.subheader("Per-stage risk and survival curve")
-col1, col2 = st.columns([1,2])
+# timeline: stages + legal events
+st.subheader("Case timeline (stages + legal events)")
+# build stage points
+stages = ["notification","award","compensation","rnr","possession"]
+stage_points = []
+for s in stages:
+    ent = row.get(f"{s}_entry", "")
+    comp = row.get(f"{s}_completion", "")
+    if ent:
+        stage_points.append((s, ent, 'entry'))
+    if comp:
+        stage_points.append((s, comp, 'completion'))
+
+# legal events for project
+proj_legal = legal_df[legal_df['project_id'] == proj].sort_values('date')
+
+# plot timeline
+fig2, ax2 = plt.subplots(figsize=(10,2))
+y = 0
+for s, date_str, typ in stage_points:
+    try:
+        dt = pd.to_datetime(date_str)
+        ax2.plot([dt], [y], marker='o', label=f"{s}:{typ}")
+        ax2.text(dt, y+0.02, f"{s[:3]}-{typ[0]}", rotation=45)
+    except Exception:
+        pass
+for idx, ev in proj_legal.iterrows():
+    dt = pd.to_datetime(ev['date'])
+    ax2.plot([dt], [y-0.05], marker='x', color='red')
+    ax2.text(dt, y-0.1, f"{ev['event_type']}({ev['severity']})", rotation=45, color='red')
+ax2.get_yaxis().set_visible(False)
+ax2.set_xlabel('Date')
+st.pyplot(fig2)
+
+# predicted survival curves, expected time, and risk-within-T per stage
+st.subheader("Per-stage survival, expected time (RMST up to horizon) & risk-within-T")
+col1, col2 = st.columns([1,1])
+
+# what-if controls
 with col1:
-    st.write("Original features")
-    st.write(row[["collector_capacity","pending_projects"]])
-    # counterfactual sliders
-    cf_capacity = st.slider("collector_capacity", min_value=1, max_value=20, value=int(row["collector_capacity"]))
-    cf_pending = st.slider("pending_projects", min_value=0, max_value=20, value=int(row["pending_projects"]))
-    apply_cf = st.button("Apply counterfactual")
+    st.markdown("### What-if: feature adjustments")
+    cf_capacity = st.slider("collector_capacity", 1, 20, int(row['collector_capacity']))
+    cf_pending = st.slider("pending_projects", 0, 20, int(row['pending_projects']))
+    st.markdown("### Stage-level intervention")
+    intervene_stage = st.selectbox("Expedite stage (shift survival curve by -X days)", options=['None'] + stages)
+    expedite_days = st.slider("Expedite days (reduce expected duration)", 0, 120, 0)
+    apply_cf = st.button("Apply what-if")
 
 with col2:
-    fig, ax = plt.subplots(figsize=(6,4))
-    T = np.linspace(0, risk_horizon, 100)
-    for s, m in models.items():
-        # build X for single project
+    fig3, ax3 = plt.subplots(figsize=(6,4))
+    for s, m in rsf_models.items():
+        # build feature vector
         X = pd.DataFrame([row[["district","project_type","land_category","area_ha","affected_families","collector_capacity","verification_teams","pending_projects","legal_risk"]]])
-        if apply_cf:
-            X.loc[0, "collector_capacity"] = cf_capacity
-            X.loc[0, "pending_projects"] = cf_pending
+        X.loc[0, 'collector_capacity'] = cf_capacity
+        X.loc[0, 'pending_projects'] = cf_pending
         try:
             fn = m.predict_survival_function(X)[0]
             times = np.array(fn.x) if hasattr(fn, 'x') else np.array([t for t,_ in fn])
             probs = np.array(fn.y) if hasattr(fn, 'y') else np.array([p for _,p in fn])
-            # plot stepped survival
-            ax.step(times, probs, where='post', label=s)
-        except Exception as e:
-            # fallback: skip
+            # apply expedite shift if applicable (approximation)
+            if apply_cf and intervene_stage == s and expedite_days > 0:
+                # shifting survival left: S_new(t) = S_old(t + expedite_days)
+                times_shifted = times - expedite_days
+                times_shifted[times_shifted < 0] = 0
+                ax3.step(times_shifted, probs, where='post', label=f"{s} (expedited)")
+            else:
+                ax3.step(times, probs, where='post', label=s)
+        except Exception:
             pass
-    ax.set_xlabel("Days since stage entry")
-    ax.set_ylabel("Survival probability S(t)")
-    ax.legend()
-    st.pyplot(fig)
+    ax3.set_xlabel('Days since stage entry')
+    ax3.set_ylabel('Survival S(t)')
+    ax3.legend()
+    st.pyplot(fig3)
 
-# show derived risk within horizon
-st.subheader(f"Risk within {risk_horizon} days per stage (1 - S({risk_horizon}))")
+# compute expected RMST and risk-within-T table
 risk_table = {}
-for s, m in models.items():
+for s, m in rsf_models.items():
     X = pd.DataFrame([row[["district","project_type","land_category","area_ha","affected_families","collector_capacity","verification_teams","pending_projects","legal_risk"]]])
-    if apply_cf:
-        X.loc[0, "collector_capacity"] = cf_capacity
-        X.loc[0, "pending_projects"] = cf_pending
+    X.loc[0, 'collector_capacity'] = cf_capacity
+    X.loc[0, 'pending_projects'] = cf_pending
     try:
         fn = m.predict_survival_function(X)[0]
         times = np.array(fn.x) if hasattr(fn, 'x') else np.array([t for t,_ in fn])
         probs = np.array(fn.y) if hasattr(fn, 'y') else np.array([p for _,p in fn])
+        # compute S(h)
         if risk_horizon <= times[0]:
             S_h = 1.0
         else:
             idx = np.searchsorted(times, risk_horizon, side='right') - 1
             idx = max(0, min(idx, len(probs)-1))
             S_h = probs[idx]
-        risk_table[s] = float(1.0 - S_h)
+        risk = 1.0 - S_h
+        # RMST up to horizon
+        times_for_integ = np.concatenate(([0.0], times[times <= risk_horizon], [risk_horizon]))
+        probs_for_integ = []
+        for t in times_for_integ:
+            if t <= times[0]:
+                probs_for_integ.append(1.0)
+            else:
+                idx = np.searchsorted(times, t, side='right') - 1
+                idx = max(0, min(idx, len(probs)-1))
+                probs_for_integ.append(probs[idx])
+        rmst = 0.0
+        for k in range(len(times_for_integ)-1):
+            dt = times_for_integ[k+1] - times_for_integ[k]
+            rmst += probs_for_integ[k] * dt
+        # if expedite applied and target stage matches, adjust rmst by subtracting expedite_days (simple approx)
+        if apply_cf and intervene_stage == s and expedite_days > 0:
+            rmst = max(0.0, rmst - expedite_days)
+        risk_table[s] = {"risk_within_T": float(risk), "rmst_up_to_T": float(rmst)}
     except Exception:
-        risk_table[s] = None
+        risk_table[s] = {"risk_within_T": None, "rmst_up_to_T": None}
 
-st.table(pd.DataFrame.from_dict(risk_table, orient='index', columns=['risk_within_T']))
+st.table(pd.DataFrame(risk_table).T)
 
-st.markdown("Note: feature explainability for RSF is shown as variable importance (mean decrease in impurity proxy). For production we recommend SHAP-like surrogates or PDP/ICE visualizations.")
-# show feature importances for the selected stage
-st.subheader(f"Feature importances (stage: {selected_stage})")
-if selected_stage in models:
+# Explainability via surrogate + SHAP
+st.subheader("Explainability (surrogate model for risk-within-T)")
+if selected_stage in surrogates:
+    sur = surrogates[selected_stage]
+    # prepare transformed data for SHAP background (sample)
+    X_bg = df[["district","project_type","land_category","area_ha","affected_families","collector_capacity","verification_teams","pending_projects","legal_risk"]].sample(min(200, len(df)))
+    # apply CF adjustments to project row
+    x_row = pd.DataFrame([row[["district","project_type","land_category","area_ha","affected_families","collector_capacity","verification_teams","pending_projects","legal_risk"]]])
+    x_row.loc[0,'collector_capacity'] = cf_capacity
+    x_row.loc[0,'pending_projects'] = cf_pending
     try:
-        model = models[selected_stage]
-        rsf = model.named_steps['rsf']
-        # if OneHot encoding expanded features, importances align to transformed features; show raw numerical insides as proxy
-        importances = rsf.feature_importances_
-        # build feature names
-        pre = model.named_steps['pre']
-        ohe = pre.named_transformers_['ohe']
-        cat_names = ohe.get_feature_names_out(["district","project_type","land_category"]).tolist()
-        feature_names = list(cat_names) + ["area_ha","affected_families","collector_capacity","verification_teams","pending_projects","legal_risk"]
-        imp_df = pd.DataFrame({"feature": feature_names, "importance": importances})
-        imp_df = imp_df.sort_values("importance", ascending=False).head(20)
-        st.bar_chart(imp_df.set_index('feature')['importance'])
+        # extract regressor from pipeline
+        reg = sur.named_steps['reg']
+        pre = sur.named_steps['pre']
+        X_bg_trans = pre.transform(X_bg)
+        x_row_trans = pre.transform(x_row)
+        explainer = shap.Explainer(reg, X_bg_trans)
+        shap_values = explainer(x_row_trans)
+        st.write("SHAP values (top contributors):")
+        # map transformed feature names
+        try:
+            ohe = pre.named_transformers_['ohe']
+            cat_names = ohe.get_feature_names_out(["district","project_type","land_category"]).tolist()
+            transformed_names = list(cat_names) + ["area_ha","affected_families","collector_capacity","verification_teams","pending_projects","legal_risk"]
+        except Exception:
+            transformed_names = [f"f{i}" for i in range(x_row_trans.shape[1])]
+        sv = shap_values.values[0]
+        df_shap = pd.DataFrame({"feature": transformed_names, "shap": sv})
+        df_shap = df_shap.assign(abs_shap=df_shap['shap'].abs()).sort_values('abs_shap', ascending=False).head(12)
+        st.table(df_shap[['feature','shap']])
+        # small bar chart
+        fig4, ax4 = plt.subplots(figsize=(6,3))
+        ax4.barh(df_shap['feature'], df_shap['shap'])
+        st.pyplot(fig4)
     except Exception as e:
-        st.write("Could not compute importances:", e)
+        st.write("Explainability failed:", e)
+        st.write("Fallback: model feature importances are shown in the dashboard.")
 else:
-    st.write("No model for selected stage loaded.")
+    st.write("No surrogate explainability model available for this stage.")
 
+st.markdown("""
+Notes:
+- Stage mapping follows RFCTLARR common terminology: Notification → Award → Compensation → R&R → Possession.
+- Expected time shown is a restricted mean up to the selected risk horizon (RMST); production systems should estimate full expected time and uncertainty.
+- The expedite intervention is an approximation (shifting the survival curve left). A production-level intervention model should be trained/tested on historical interventions.
+""")
