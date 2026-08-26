@@ -7,7 +7,7 @@ Computes per-project legal risk scores (weighted by event severity + recency dec
 and per-district litigation density (mean risk + dispute frequency).
 Used as input features for survival models and for district contention analysis.
 
-Python 3.14+ compatible with PEP 695 type aliases and modern type hints.
+Python 3.10+ compatible with proper type hints.
 """
 from __future__ import annotations
 
@@ -17,11 +17,6 @@ from typing import Any, Optional
 
 import numpy as np
 import pandas as pd
-
-
-# Type aliases (Python 3.14 PEP 695)
-NDArray = np.ndarray[Any, np.dtype[np.floating[Any]]]
-FloatSeries = pd.Series[float]
 
 
 def load_legal_events(filepath: str = "data/legal_events.csv") -> pd.DataFrame:
@@ -34,7 +29,7 @@ def load_legal_events(filepath: str = "data/legal_events.csv") -> pd.DataFrame:
 def compute_project_legal_risk(
     legal_df: pd.DataFrame, 
     reference_date: Optional[datetime | str] = None
-) -> FloatSeries:
+) -> pd.Series:
     """
     Compute per-project legal risk score.
     
@@ -80,7 +75,7 @@ def compute_project_legal_risk(
     )
     
     # aggregate per project
-    project_risk: FloatSeries = legal_df.groupby("project_id")["weighted_risk"].sum()
+    project_risk: pd.Series = legal_df.groupby("project_id")["weighted_risk"].sum()
     return project_risk
 
 
@@ -116,7 +111,7 @@ def compute_district_legal_metrics(
     if projects_df is not None:
         projects_risk = projects_df[["project_id", "district"]].copy()
         projects_risk["legal_risk_score"] = projects_risk["project_id"].map(project_risk).fillna(0)
-        mean_risk: FloatSeries = projects_risk.groupby("district")["legal_risk_score"].mean()
+        mean_risk: pd.Series = projects_risk.groupby("district")["legal_risk_score"].mean()
     else:
         mean_risk = pd.Series(dtype=float)
     
